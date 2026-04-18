@@ -203,6 +203,43 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001) -> torch.Tensor:
     return d1 * cost * d0.unsqueeze(1)
 
 
+def dual_cd1(S, k, beta, first_run=False, ema_decay=0.9):
+    """Dual coordinate-descent quantile-balancing routing assignment.
+
+    Selects the top-k experts per token from ``S - beta`` and updates the
+    per-expert bias ``beta`` so that each expert is selected by approximately
+    ``m * k / n`` tokens. The bias is mean-centered and smoothed with an EMA.
+
+    Args:
+        S (torch.Tensor): Score tensor of shape ``[m, n]`` (tokens, experts).
+        k (int): Number of experts to select per token (topk).
+        beta (torch.Tensor): Current per-expert bias of shape ``[n]``.
+        first_run (bool): Reserved for warm-up iterations on the first call.
+        ema_decay (float): EMA decay applied to the new ``beta`` estimate.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: The selected indices of shape
+        ``[m, k]`` and the updated ``beta`` of shape ``[n]``.
+    """
+    m, n = S.shape
+    col_target = m * k // n
+
+    if first_run:
+        for _ in range(0):
+            alpha = (S - beta).topk(k + 1, dim=1).values[:, -1:]
+            beta = (S - alpha).topk(col_target + 1, dim=0).values[-1]
+
+    topk_result = (S - beta).topk(k + 1, dim=1)
+    indices = topk_result.indices[:, :-1]
+    alpha = topk_result.values[:, -1:]
+
+    beta_new = (S - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
+    beta_new = ema_decay * beta + (1 - ema_decay) * beta_new
+    beta_new = beta_new - beta_new.mean()
+
+    return indices, beta_new
+
+
 def get_capacity(
     num_tokens: int, num_experts: int, capacity_factor: float, min_capacity: Optional[int] = None
 ) -> int:

@@ -642,6 +642,9 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
+    - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Unlike sinkhorn,
+    this composes with the per-sequence aux loss; `seq_aux_loss` is unconditionally applied
+    when QB is active, and can be disabled by setting `moe_aux_loss_coeff` to 0.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
