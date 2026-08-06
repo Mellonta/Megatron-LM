@@ -193,9 +193,6 @@ class MambaContextParallel:
         dt = _all_to_all_cp2hp(dt, self.cp_group)
 
         output = torch.cat([z, x, B, C, dt], dim=-1)
-        # TODO(duncan): for hybrid models, consider isolating load-balancing to attention layers
-        output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
-
         return output
 
     def post_conv_ssm(
@@ -204,11 +201,7 @@ class MambaContextParallel:
         """Method to be applied after the convolution and SSM"""
         if self.cp_size == 1:
             return input_
-        else:
-            return _all_to_all_hp2cp(
-                _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params),
-                self.cp_group,
-            )
+        return _all_to_all_hp2cp(input_, self.cp_group)
 
     def conv1d(self, input_: torch.Tensor) -> torch.Tensor:
         """

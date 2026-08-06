@@ -21,8 +21,20 @@ class TestMambaContextParallel:
             (1, 4, True),  # ngroups_local_tp < cp_size
         ],
     )
-    def test_forward(self, ngroups_local_tp, cp_size, D_has_hdim):
+    def test_forward(self, ngroups_local_tp, cp_size, D_has_hdim, monkeypatch):
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
+
+        def fail_on_zigzag_reordering(*_args, **_kwargs):
+            pytest.fail("Mamba context parallelism must preserve contiguous sequence order")
+
+        monkeypatch.setattr(
+            "megatron.core.ssm.mamba_context_parallel._undo_attention_load_balancing",
+            fail_on_zigzag_reordering,
+        )
+        monkeypatch.setattr(
+            "megatron.core.ssm.mamba_context_parallel._redo_attention_load_balancing",
+            fail_on_zigzag_reordering,
+        )
 
         dtype = torch.bfloat16
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

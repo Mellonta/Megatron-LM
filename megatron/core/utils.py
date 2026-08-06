@@ -2456,18 +2456,12 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
 def _get_batch_on_this_cp_rank_per_sequence_balancing(
     batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
 ):
-    """Partition a batch across CP ranks with per-sequence zigzag load balancing.
+    """Partition a batch into contiguous sequence shards across CP ranks.
 
-    Applies zigzag load-balanced chunking across the entire sequence. The
-    sequence is split into ``2 * cp_size`` equal chunks and assigned in a
-    zigzag pattern: for CP=2, the 4 chunks are assigned as
-    (chunk_0, chunk_3) -> GPU 0 and (chunk_1, chunk_2) -> GPU 1, balancing
-    compute for causal attention where later tokens attend to more
-    predecessors. The sequence length must be divisible by
-    ``2 * cp_size``. All tensor-valued entries in the batch are
-    partitioned along their sequence dimension; metadata keys
-    (cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) and None-valued
-    entries are left unchanged.
+    Rank ``r`` receives sequence range ``[r * local_seq_len,
+    (r + 1) * local_seq_len)``. All tensor-valued entries in the batch are
+    partitioned along their sequence dimension; metadata and provenance fields
+    are left unchanged.
 
     Args:
         batch (dict[str, torch.Tensor]): Batch dict with tensors of shape
@@ -2483,14 +2477,16 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
-    # HybridCP metadata is not partitioned along the sequence dim — skip by key.
-    # Intermediate PP stages set non-metadata keys to None, so still skip those.
+    # HybridCP metadata and blended-dataset provenance are not partitioned
+    # along the sequence dimension. Intermediate PP stages set other entries
+    # to None, so skip those as well.
     METADATA_KEYS = (
         'cu_seqlens',
         'cu_seqlens_padded',
         'max_seqlen',
         'local_cp_size',
         'hybrid_cp_group',
+        'dataset_id',
     )
 
     if cp_size > 1:
@@ -2498,18 +2494,13 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
             if key in METADATA_KEYS or val is None:
                 continue
             seq_dim = 2 if key == 'attention_mask' else 1
-            val = val.view(
-                *val.shape[0:seq_dim],
-                2 * cp_size,
-                val.shape[seq_dim] // (2 * cp_size),
-                *val.shape[(seq_dim + 1) :],
-            )
-            index = torch.zeros(2, dtype=torch.int64, device=val.device)
-            index[0].fill_(cp_rank)
-            index[1].fill_(2 * cp_size - cp_rank - 1)
-            val = val.index_select(seq_dim, index)
-            val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
-            batch[key] = val
+            if val.shape[seq_dim] % cp_size != 0:
+                raise ValueError(
+                    f"The sequence dimension for {key!r} must be divisible by CP size, "
+                    f"got {val.shape[seq_dim]} and CP size {cp_size}."
+                )
+            local_seq_len = val.shape[seq_dim] // cp_size
+            batch[key] = val.narrow(seq_dim, cp_rank * local_seq_len, local_seq_len)
 
     return batch
 
@@ -2620,7 +2611,7 @@ def get_batch_on_this_cp_rank(
 
     Routes to the appropriate CP partitioning strategy based on the batch
     contents and parallelism mode:
-      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, or when
+      - **Per-sequence contiguous**: When ``cu_seqlens`` is None, or when
         ``use_per_sequence_balancing`` is True, delegates to
         ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
       - **Per-document zigzag**: When ``cu_seqlens`` is present and
@@ -2639,10 +2630,9 @@ def get_batch_on_this_cp_rank(
         hybrid_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
             Factory function that returns a hybrid CP process group for a given
             ``group_size``. Required when ``is_hybrid_cp`` is True.
-        use_per_sequence_balancing (bool): When True, use per-sequence zigzag
-            even when ``cu_seqlens`` is present (e.g., for inter-document
-            masking where document lengths are not divisible by
-            ``2 * cp_size``).
+        use_per_sequence_balancing (bool): When True, use per-sequence contiguous
+            partitioning even when ``cu_seqlens`` is present (e.g., for
+            inter-document masking).
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned

@@ -561,8 +561,8 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
 
-    # With CP > 1 and per-sequence balancing, sequence-dimension tensors
-    # are zigzag-partitioned to seq_length // cp_size while cu_seqlens
+    # With CP > 1 and per-sequence partitioning, sequence-dimension tensors
+    # are contiguously partitioned to seq_length // cp_size while cu_seqlens
     # and max_seqlen are left unchanged.
     partitioned_seq_length = seq_length // cp_size
 
@@ -635,22 +635,27 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
 
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
-@pytest.mark.parametrize("seq_length", [16, 1024])
+@pytest.mark.parametrize("seq_length", [12, 16, 1024])
 def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
-    """Verify that per-sequence zigzag balancing selects the correct chunks.
+    """Verify that per-sequence CP partitioning selects contiguous chunks.
 
-    Constructs a batch with tokens = range(seq_length) and checks that each
-    simulated CP rank receives the expected zigzag-interleaved chunks.
+    Constructs sequence tensors with values tied to their global positions and
+    checks that each simulated CP rank receives one adjacent range.
     """
     tokens = torch.arange(seq_length, dtype=torch.int64).unsqueeze(0)
+    attention_mask = torch.arange(seq_length, dtype=torch.int64).view(1, 1, seq_length, 1)
     cu_seqlens = torch.tensor([[0, seq_length // 2, seq_length]], dtype=torch.int32)
     max_seqlen = torch.tensor([seq_length // 2], dtype=torch.int32)
+    dataset_id = torch.tensor(1, dtype=torch.int64)
 
     for cp_rank in range(cp_size):
         batch = {
             'tokens': tokens.clone(),
+            'labels': tokens.clone(),
+            'attention_mask': attention_mask.clone(),
             'cu_seqlens': cu_seqlens.clone(),
             'max_seqlen': max_seqlen.clone(),
+            'dataset_id': dataset_id.clone(),
         }
 
         mock_group = MagicMock()
@@ -660,27 +665,19 @@ def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
         ):
             result = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=mock_group)
 
-        if cp_size == 1:
-            assert torch.equal(result['tokens'], tokens)
-        else:
-            # The sequence is split into 2*cp_size equal chunks. This rank
-            # gets chunk cp_rank and chunk 2*cp_size - cp_rank - 1.
-            chunk_size = seq_length // (2 * cp_size)
-            chunk_0_start = cp_rank * chunk_size
-            chunk_1_start = (2 * cp_size - cp_rank - 1) * chunk_size
-            expected = torch.cat(
-                [
-                    tokens[0, chunk_0_start : chunk_0_start + chunk_size],
-                    tokens[0, chunk_1_start : chunk_1_start + chunk_size],
-                ]
-            ).unsqueeze(0)
-            assert torch.equal(
-                result['tokens'], expected
-            ), f"cp_rank={cp_rank}: expected {expected}, got {result['tokens']}"
+        local_seq_len = seq_length // cp_size
+        local_start = cp_rank * local_seq_len
+        local_end = local_start + local_seq_len
+        expected_tokens = tokens[:, local_start:local_end]
+        expected_attention_mask = attention_mask[:, :, local_start:local_end]
+        assert torch.equal(result['tokens'], expected_tokens)
+        assert torch.equal(result['labels'], expected_tokens)
+        assert torch.equal(result['attention_mask'], expected_attention_mask)
 
-        # cu_seqlens and max_seqlen must be unchanged.
+        # Metadata and provenance fields must be unchanged.
         assert torch.equal(result['cu_seqlens'], cu_seqlens)
         assert torch.equal(result['max_seqlen'], max_seqlen)
+        assert torch.equal(result['dataset_id'], dataset_id)
 
 
 def create_pretrain_data_iterator(
